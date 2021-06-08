@@ -1,611 +1,750 @@
 /*!
- * automation-extra-plugin v4.2.1 by berstend
- * https://github.com/berstend/puppeteer-extra/tree/master/packages/automation-extra-plugin
+ * automation-extra v4.2.0 by berstend
+ * https://github.com/berstend/puppeteer-extra/tree/master/packages/automation-extra
  * @license MIT
  */
-import debug from 'debug';
-import { EventEmitter } from 'events';
-import { isPlainObject } from 'is-plain-object';
+import { LauncherEnv } from 'automation-extra-plugin';
+import Debug from 'debug';
 
-// We use dummy/noop functions in PluginLifecycleMethods meant to be overriden
-/* tslint:disable:no-empty */
-/** @private */
-const merge = require('deepmerge');
-const mergeOptions = { isMergeableObject: isPlainObject };
-/**
- * Plugin lifecycle methods used by AutomationExtraPlugin.
- *
- * These are hooking into Playwright/Puppeteer events and are meant to be overriden
- * on a per-need basis in your own plugin extending AutomationExtraPlugin.
- *
- * @class PluginLifecycleMethods
- */
-class PluginLifecycleMethods {
+const debug$1 = Debug('automation-extra:plugins');
+class PluginList {
+    constructor(env) {
+        this.env = env;
+        this._plugins = [];
+    }
     /**
-     * After the plugin has been registered, called early in the life-cycle (once the plugin has been added).
+     * Get a list of all registered plugins.
+     *
+     * @member {Array<types.Plugin>}
      */
-    async onPluginRegistered() { }
+    get list() {
+        return this._plugins;
+    }
     /**
-     * Before a new browser instance is created/launched.
+     * Get the names of all registered plugins.
      *
-     * Can be used to modify the puppeteer/playwright launch options by modifying or returning them.
-     *
-     * Plugins using this method will be called in sequence to each
-     * be able to update the launch options.
-     *
-     * @example
-     * async beforeLaunch (options) {
-     *   if (this.opts.flashPluginPath) {
-     *     options.args = options.args || []
-     *     options.args.push(`--ppapi-flash-path=${this.opts.flashPluginPath}`)
-     *   }
-     * }
-     *
-     * @param options - Puppeteer/Playwright launch options
+     * @member {Array<string>}
+     * @private
      */
-    async beforeLaunch(options) { }
+    get names() {
+        return this._plugins.map(p => p.name);
+    }
     /**
-     * After the browser has launched.
+     * Add a new plugin to the list (after checking if it's well-formed).
      *
-     * Note: Don't assume that there will only be a single browser instance during the lifecycle of a plugin.
-     * It's possible that `pupeeteer.launch` will be  called multiple times and more than one browser created.
-     * In order to make the plugins as stateless as possible don't store a reference to the browser instance
-     * in the plugin but rather consider alternatives.
-     *
-     * E.g. when using `onPageCreated` you can get a browser reference by using `page.browser()`.
-     *
-     * Alternatively you could expose a class method that takes a browser instance as a parameter to work with:
-     *
-     * ```es6
-     * const fancyPlugin = require('puppeteer-extra-plugin-fancy')()
-     * puppeteer.use(fancyPlugin)
-     * const browser = await puppeteer.launch()
-     * await fancyPlugin.killBrowser(browser)
-     * ```
-     *
-     * @param  browser - The `puppeteer` or `playwright` browser instance.
-     *
-     * @example
-     * async afterLaunch (browser, opts) {
-     *   this.debug('browser has been launched', opts.options)
-     * }
+     * @param plugin
+     * @private
      */
-    async afterLaunch(browser, launchContext) { }
+    add(plugin) {
+        if (!plugin || !plugin.name) {
+            throw new Error('A plugin must have a .name property');
+        }
+        const isPuppeteerExtraPlugin = plugin._isPuppeteerExtraPlugin === true;
+        const isPlaywrightDriver = this.env.driverName === 'playwright';
+        if (isPuppeteerExtraPlugin && isPlaywrightDriver) {
+            console.warn(`Warning: Plugin "${plugin.name || 'unknown'}" is derived from PuppeteerExtraPlugin and will most likely not work with playwright.`);
+        }
+        // Give the plugin access to the env info
+        plugin.env = this.env;
+        if ('onPluginRegistered' in plugin) {
+            plugin.onPluginRegistered();
+            this.env.events.emit('onPluginRegistered');
+        }
+        if (plugin.requirements.has('dataFromPlugins')) {
+            plugin.getDataFromPlugins = this.getData.bind(this);
+        }
+        this._plugins.push(plugin);
+    }
     /**
-     * Before connecting to an existing browser instance.
+     * Dispatch plugin lifecycle events in a typesafe way.
+     * Only Plugins that expose the supplied property will be called.
      *
-     * Can be used to modify the puppeteer/playwright connect options by modifying or returning them.
+     * Will not await results to dispatch events as fast as possible to all plugins.
      *
-     * Plugins using this method will be called in sequence to each
-     * be able to update the launch options.
-     *
-     * @param options - Puppeteer/playwright connect options
+     * @param name - The lifecycle method name
+     * @param args - Optional: Any arguments to be supplied to the plugin methods
      */
-    async beforeConnect(options) { }
+    dispatch(name, ...args) {
+        const filteredPlugins = this.filteredPlugins;
+        const plugins = filteredPlugins.filter(plugin => name in plugin);
+        debug$1('dispatch', {
+            name,
+            currentEnv: `${this.env.driverName}:${this.env.browserName}`,
+            plugins: {
+                all: this._plugins.length,
+                filtered: filteredPlugins.length,
+                filteredWithEvent: plugins.length
+            }
+        });
+        for (const plugin of plugins) {
+            try {
+                ;
+                plugin[name](...args);
+            }
+            catch (err) {
+                console.warn(`An error occured while executing ${name} in plugin "${plugin.name}":`, err);
+            }
+        }
+        this.env.events.emit(name, ...args);
+    }
     /**
-     * After connecting to an existing browser instance.
+     * Dispatch plugin lifecycle events in a typesafe way.
+     * Only Plugins that expose the supplied property will be called.
      *
-     * > Note: Don't assume that there will only be a single browser instance during the lifecycle of a plugin.
+     * Can also be used to get a definite return value after passing it to plugins:
+     * Calls plugins sequentially and passes on a value (waterfall style).
      *
-     * @param browser - The `puppeteer` or playwright browser instance.
+     * The plugins can either modify the value or return an updated one.
+     * Will return the latest, updated value which ran through all plugins.
      *
+     * By convention only the first argument will be used as the updated value.
+     *
+     * @param name - The lifecycle method name
+     * @param args - Optional: Any arguments to be supplied to the plugin methods
      */
-    async afterConnect(browser, launchContext) { }
+    async dispatchBlocking(name, ...args) {
+        const filteredPlugins = this.filteredPlugins;
+        const plugins = filteredPlugins.filter(plugin => name in plugin);
+        debug$1('dispatchBlocking', {
+            name,
+            currentEnv: `${this.env.driverName}:${this.env.browserName}`,
+            plugins: {
+                all: this._plugins.length,
+                filtered: filteredPlugins.length,
+                filteredWithEvent: plugins.length
+            }
+        });
+        let retValue = null;
+        for (const plugin of plugins) {
+            try {
+                retValue = await plugin[name](...args);
+                // In case we got a return value use that as new first argument for followup function calls
+                if (retValue !== undefined) {
+                    args[0] = retValue;
+                }
+            }
+            catch (err) {
+                console.warn(`An error occured while executing ${name} in plugin "${plugin.name}":`, err);
+                return retValue;
+            }
+        }
+        this.env.events.emit(name, ...args);
+        return retValue;
+    }
+    dispatchLegacy(name, ...args) {
+        const filteredPlugins = this.filteredPlugins;
+        const plugins = filteredPlugins.filter(plugin => name in plugin);
+        debug$1('dispatch', {
+            name,
+            currentEnv: `${this.env.driverName}:${this.env.browserName}`,
+            plugins: {
+                all: this._plugins.length,
+                filtered: filteredPlugins.length,
+                filteredWithEvent: plugins.length
+            }
+        });
+        for (const plugin of plugins) {
+            try {
+                ;
+                plugin[name](...args);
+                // In case we got a return value use that as new first argument for followup function calls
+            }
+            catch (err) {
+                console.warn(`An error occured while executing ${name} in plugin "${plugin.name}":`, err);
+            }
+        }
+    }
     /**
-     * Called when a browser instance is available.
-     *
-     * This applies to both `launch` and `connect`.
-     *
-     * Convenience method created for plugins that need access to a browser instance
-     * and don't mind if it has been created through `launch` or `connect`.
-     *
-     * > Note: Don't assume that there will only be a single browser instance during the lifecycle of a plugin.
-     *
-     * @param browser - The `puppeteer` or `playwright` browser instance.
+     * Filter plugins based on their `filter` stanza
      */
-    async onBrowser(browser, launchContext) { }
+    get filteredPlugins() {
+        const currentEnv = `${this.env.driverName}:${this.env.browserName}`;
+        const plugins = this._plugins.filter(plugin => {
+            var _a, _b, _c, _d;
+            // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions
+            if ((_b = (_a = plugin.filter) === null || _a === void 0 ? void 0 : _a.include) === null || _b === void 0 ? void 0 : _b.length) {
+                return plugin.filter.include.includes(currentEnv);
+                // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions
+            }
+            else if ((_d = (_c = plugin.filter) === null || _c === void 0 ? void 0 : _c.exclude) === null || _d === void 0 ? void 0 : _d.length) {
+                // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions
+                return !plugin.filter.exclude.includes(currentEnv);
+            }
+            return true; // keep plugin
+        });
+        return plugins;
+    }
     /**
-     * Before a new browser context is created.
+     * Order plugins that have expressed a special placement requirement.
      *
-     * Note: Currently only triggered by `playwright`, as puppeteer's usage of context is very lackluster.
+     * This is useful/necessary for e.g. plugins that depend on the data from other plugins.
      *
-     * Plugins using this method will be called in sequence to each
-     * be able to update the context options.
-     *
-     * @see https://github.com/microsoft/playwright/blob/master/docs/api.md#browsernewcontextoptions
-     *
-     * @param options - Playwright browser context options
-     * @param browser - Playwright browser
+     * @private
      */
-    async beforeContext(options, browser) { }
+    order() {
+        debug$1('order:before', this.names);
+        const runLast = this._plugins
+            .filter(p => p.requirements.has('runLast'))
+            .map(p => p.name);
+        for (const name of runLast) {
+            const index = this._plugins.findIndex(p => p.name === name);
+            this._plugins.push(this._plugins.splice(index, 1)[0]);
+        }
+        debug$1('order:after', this.names);
+    }
     /**
-     * After a new browser context has been created.
+     * Lightweight plugin requirement checking.
      *
-     * Note: `playwright` specific.
+     * The main intent is to notify the user when a plugin won't work as expected.
      *
-     * @param  options - Playwright browser context options
-     * @param  context - Playwright browser context
+     * @todo This could be improved, e.g. be evaluated by the plugin base class.
+     *
+     * @private
      */
-    async onContextCreated(context, options) { }
+    checkRequirements(launchContext) {
+        for (const plugin of this._plugins) {
+            for (const requirement of plugin.requirements) {
+                if (launchContext.context === 'launch' &&
+                    requirement === 'headful' &&
+                    launchContext.isHeadless) {
+                    debug$1(`Warning: Plugin '${plugin.name}' is not supported in headless mode.`);
+                }
+                if (launchContext.context === 'connect' && requirement === 'launch') {
+                    debug$1(`Warning: Plugin '${plugin.name}' doesn't support connect().`);
+                }
+            }
+        }
+    }
     /**
-     * Called when a page has been created.
+     * Collects the exposed `data` property of all registered plugins.
+     * Will be reduced/flattened to a single array.
      *
-     * The event will also fire for popup pages.
+     * Can be accessed by plugins that listed the `dataFromPlugins` requirement.
      *
-     * @see https://playwright.dev/#version=v1.3.0&path=docs%2Fapi.md&q=event-page
-     * @see https://pptr.dev/#?product=Puppeteer&version=main&show=api-event-targetcreated
+     * Implemented mainly for plugins that need data from other plugins (e.g. `user-preferences`).
      *
-     * @param  {Puppeteer.Page|Playwright.Page} page
-     * @example
-     * async onPageCreated (page) {
-     *   let ua = await page.browser().userAgent()
-     *   if (this.opts.stripHeadless) {
-     *     ua = ua.replace('HeadlessChrome/', 'Chrome/')
-     *   }
-     *   this.debug('new ua', ua)
-     *   await page.setUserAgent(ua)
-     * }
+     * @see [PuppeteerExtraPlugin]/data
+     * @param name - Filter data by optional name
+     *
+     * @private
      */
-    async onPageCreated(page) { }
+    getData(name) {
+        const data = this._plugins
+            .filter((p) => !!p.data)
+            .map((p) => (Array.isArray(p.data) ? p.data : [p.data]))
+            .reduce((acc, arr) => [...acc, ...arr], []);
+        return name ? data.filter((d) => d.name === name) : data;
+    }
     /**
-     * Called when a page has been closed.
+     * Lightweight plugin dependency management to require plugins and code mods on demand.
      *
+     * This uses the `dependencies` stanza (a `Set` or `Map`) exposed by `automation-extra` plugins.
+     *
+     * @private
      */
-    async onPageClose(page) { }
-    /**
-     * Called when a worker has been created.
-     *
-     * This is a unified event for dedicated, service and shared workers.
-     */
-    async onWorkerCreated(worker) { }
-    /**
-     * Called when a browser context has been closed.
-     *
-     * Note: `playwright` specific.
-     *
-     */
-    async onContextClose(context) { }
-    /**
-     * Called when the browser got disconnected.
-     *
-     * This might happen because of one of the following:
-     * - The browser is closed or crashed
-     * - The `browser.disconnect` method was called
-     *
-     * @param browser - The `puppeteer` or `playwright` browser instance.
-     */
-    async onDisconnected(browser) { }
+    resolveDependencies() {
+        var _a;
+        debug$1('resolveDependencies');
+        const pluginNames = new Set(this._plugins.map((p) => p.name));
+        // Handle `plugins` stanza
+        this._plugins
+            .filter(p => 'plugins' in p && p.plugins.length)
+            .map(p => p)
+            .forEach(parent => {
+            parent.plugins
+                .filter(p => !pluginNames.has(p.name))
+                .forEach(p => {
+                debug$1('adding missing plugin', p.name);
+                // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions
+                if (parent.filter && !p.filter) {
+                    // Make child plugins inherit the parents filter if they don't have anything specified
+                    Object.defineProperty(p, 'filter', {
+                        get() {
+                            return parent.filter;
+                        }
+                    });
+                }
+                this.add(p);
+            });
+        });
+        // Handle `dependencies` stanza
+        const allDeps = new Map();
+        this._plugins
+            // Skip plugins without dependencies
+            .filter(p => 'dependencies' in p && p.dependencies.size)
+            .map(p => p.dependencies)
+            .forEach(deps => {
+            if (deps instanceof Set) {
+                deps.forEach(k => allDeps.set(k, {}));
+            }
+            if (deps instanceof Map) {
+                deps.forEach((v, k) => {
+                    allDeps.set(k, v); // Note: k,v => v,k
+                });
+            }
+        });
+        const missingDeps = new Map([...allDeps].filter(([k]) => !pluginNames.has(k)));
+        if (!missingDeps.size) {
+            debug$1('no dependencies are missing');
+            return;
+        }
+        debug$1('dependencies missing', missingDeps);
+        // Loop through all dependencies declared missing by plugins
+        for (const [name, opts] of [...missingDeps]) {
+            // Check if the dependency hasn't been registered as plugin already.
+            // This might happen when multiple plugins have nested dependencies.
+            if (this.names.includes(name)) {
+                debug$1(`ignoring dependency '${name}', which has been required already.`);
+                continue;
+            }
+            const hasFullName = name.startsWith('puppeteer-extra-plugin') ||
+                name.startsWith('automation-extra-plugin');
+            // We follow a plugin naming convention, but let's rather enforce it <3
+            const requireNames = hasFullName
+                ? [name]
+                : [`automation-extra-plugin-${name}`, `puppeteer-extra-plugin-${name}`];
+            const pkg = requirePackages$1(requireNames);
+            if (!pkg) {
+                throw new Error(`
+          A plugin listed '${name}' as dependency,
+          which is currently missing. Please install it:
+
+${requireNames
+                    .map(name => {
+                    return `yarn add ${name.split('/')[0]}`;
+                })
+                    .join(`\n or:\n`)}
+
+          Note: You don't need to require the plugin yourself,
+          unless you want to modify it's default settings.
+          `);
+            }
+            const plugin = pkg(opts);
+            this.add(plugin);
+            // Handle nested dependencies :D
+            if ((_a = plugin.dependencies) === null || _a === void 0 ? void 0 : _a.size) {
+                this.resolveDependencies();
+            }
+        }
+    }
 }
-/**
- * AutomationExtraPlugin - Meant to be used as a base class and it's methods overridden.
- *
- * Implements all `PluginLifecycleMethods`.
- *
- * @class AutomationExtraPlugin
- * @extends {PluginLifecycleMethods}
- * @example
- *   class Plugin extends AutomationExtraPlugin {
- *     static id = 'foobar'
- *     constructor(opts = {}) {
- *       super(opts)
- *     }
- *
- *     async beforeLaunch(options) {
- *       options.headless = false
- *       return options
- *     }
- *   }
- */
-class AutomationExtraPlugin extends PluginLifecycleMethods {
-    constructor(opts) {
-        super();
-        this._debugBase = debug(`automation-extra-plugin:base:${this.id}`);
-        this._opts = merge(this.defaults, opts || {}, mergeOptions);
-        // this.env = new LauncherEnv()
-        this._debugBase('Initialized.');
+function requirePackages$1(packages) {
+    for (const name of packages) {
+        try {
+            return require(name);
+        }
+        catch (_) {
+            continue; // noop
+        }
+    }
+    return false;
+}
+
+const debug = Debug('automation-extra');
+class AutomationExtraBase {
+    constructor(driverName, _launcher) {
+        this._launcher = _launcher;
+        this.env = new LauncherEnv(driverName);
+        this.plugins = new PluginList(this.env);
     }
     /**
-     * Access the static id property of the Plugin in an instance.
+     * The **main interface** to register plugins.
      *
      * @example
-     * static id = 'anonymize-ua';
-     * @private
+     * puppeteer.use(plugin1).use(plugin2)
+     * // or
+     * chromium.use(plugin1).use(plugin2)
+     * firefox.use(plugin1).use(plugin2)
+     *
+     * @see [AutomationExtraPlugin]
+     *
+     * @return The same `PuppeteerExtra` or `PlaywrightExtra` instance (for optional chaining)
      */
-    get id() {
-        if (this.constructor.id === 'base-plugin') {
-            throw new Error('Plugin must override "id"'); // If you encountered this: Add `static id = 'foobar'` to your class
+    use(plugin) {
+        const isValid = plugin && 'name' in plugin;
+        if (!isValid) {
+            throw new Error('A plugin must be provided to .use()');
         }
-        return this.constructor.id;
+        this.plugins.add(plugin);
+        debug('Plugin registered', plugin.name); /* tslint:disable-line */
+        return this;
     }
     /**
-     * Backwards compatibility, use a `static id` property instead.
-     * @private
+     * In order to support a default export which will require vanilla puppeteer or playwright automatically,
+     * as well as named exports to patch the provided launcher, we need to so some gymnastics here unfortunately.
+     *
+     * If we just do e.g. `require('puppeteer')` in our default export this would throw immediately,
+     * even when only using the `addExtra` export in combination with `puppeteer-core`. :-/
+     *
+     * The solution is to make the vanilla launcher optional and only throw once we try to effectively use and can't find it.
      */
-    get name() {
-        return this.id;
-    }
-    shim(obj) {
-        if (this.env.isPage(obj)) {
-            return new PageShim(this.env, obj);
+    get launcher() {
+        if (!this._launcher) {
+            this._launcher = this._requireLauncherOrThrow();
+            // In case we're dealing with Playwright we need to add the product name to the import
+            if (this.env.isPlaywright) {
+                this._launcher = this._launcher[this.env.browserName];
+            }
         }
-        throw new Error(`Unsupported shim: (isPage: ${this.env.isPage(obj)})`);
+        return this._launcher;
+    }
+    /** @internal */
+    async _connect(options = {}) {
+        return await this._launchOrConnect('connect', options);
+    }
+    /** @internal */
+    async _launch(options = {}) {
+        return await this._launchOrConnect('launch', options);
+    }
+    /** @internal */
+    async _launchOrConnect(method, options = {}) {
+        debug(method);
+        this.plugins.order();
+        this.plugins.resolveDependencies();
+        const beforeEvent = method === 'launch' ? 'beforeLaunch' : 'beforeConnect';
+        const afterEvent = method === 'launch' ? 'afterLaunch' : 'afterConnect';
+        // Only now we know the final browser with puppeteer
+        if (this.env.isPuppeteer) {
+            this.env.browserName = getPuppeteerProduct(options);
+        }
+        // Make it possible for plugins to use `options.args` without checking
+        if (!isConnectOptions(options)) {
+            if (typeof options.args === 'undefined') {
+                options.args = [];
+            }
+        }
+        // Give plugins the chance to modify the options before launch/connect
+        options =
+            (await this.plugins.dispatchBlocking(beforeEvent, options)) || options;
+        // One of the plugins might have changed the browser product
+        if (this.env.isPuppeteer) {
+            this.env.browserName = getPuppeteerProduct(options);
+        }
+        const isHeadless = (() => {
+            if (isConnectOptions(options)) {
+                return false; // we don't know :-)
+            }
+            if ('headless' in options) {
+                return options.headless === true;
+            }
+            return true; // default
+        })();
+        const launchContext = {
+            context: method,
+            isHeadless,
+            options
+        };
+        // Let's check requirements after plugin had the chance to modify the options
+        this.plugins.checkRequirements(launchContext);
+        const browser = await this.launcher[method](options);
+        if (this.env.isPuppeteerBrowser(browser)) {
+            this._patchPageCreationMethods(browser);
+        }
+        await this.plugins.dispatchBlocking('onBrowser', browser, launchContext);
+        if (this.env.isPuppeteerBrowser(browser)) {
+            await this._bindPuppeteerBrowserEvents(browser);
+        }
+        else {
+            await this._bindPlaywrightBrowserEvents(browser);
+        }
+        await this.plugins.dispatchBlocking(afterEvent, browser, launchContext);
+        return browser;
+    }
+    async _bindPuppeteerBrowserEvents(browser) {
+        debug('_bindPuppeteerBrowserEvents');
+        browser.on('disconnected', () => {
+            this.plugins.dispatch('onDisconnected', browser);
+            this.plugins.dispatchLegacy('onClose');
+        });
+        // eslint-disable-next-line @typescript-eslint/no-misused-promises
+        browser.on('targetcreated', async (target) => {
+            debug('targetcreated');
+            this.plugins.dispatchLegacy('onTargetCreated', target);
+            // Pre filter pages for plugin developers convenience
+            if (target.type() === 'page') {
+                const page = await target.page();
+                page.on('close', () => {
+                    this.plugins.dispatch('onPageClose', page);
+                });
+                page.on('workercreated', worker => {
+                    // handle dedicated webworkers
+                    this.plugins.dispatch('onWorkerCreated', worker);
+                });
+                this.plugins.dispatch('onPageCreated', page);
+            }
+            if (target.type() === 'service_worker' ||
+                target.type() === 'shared_worker') {
+                // handle service + shared workers
+                const worker = await target.worker();
+                if (worker) {
+                    this.plugins.dispatch('onWorkerCreated', worker);
+                }
+            }
+        });
+        // // Legacy events
+        browser.on('targetchanged', (target) => {
+            this.plugins.dispatchLegacy('onTargetChanged', target);
+        });
+        browser.on('targetdestroyed', (target) => {
+            this.plugins.dispatchLegacy('onTargetDestroyed', target);
+        });
+    }
+    async _bindPlaywrightBrowserEvents(browser) {
+        debug('_bindPlaywrightBrowserEvents');
+        browser.on('disconnected', () => {
+            this.plugins.dispatch('onDisconnected', browser);
+        });
+        const bindContextEvents = (context) => {
+            // Make sure things like `addInitScript` show an effect on the very first page as well
+            context.newPage = ((originalMethod, ctx) => {
+                return async () => {
+                    const page = await originalMethod.call(ctx);
+                    await page.goto('about:blank');
+                    return page;
+                };
+            })(context.newPage, context);
+            context.on('close', () => {
+                this.plugins.dispatch('onContextClose', context);
+            });
+            context.on('page', page => {
+                this.plugins.dispatch('onPageCreated', page);
+                page.on('close', () => {
+                    this.plugins.dispatch('onPageClose', page);
+                });
+                page.on('worker', worker => {
+                    // handle dedicated webworkers
+                    this.plugins.dispatch('onWorkerCreated', worker);
+                });
+                if (this.env.isChromium) {
+                    context.on('serviceworker', worker => {
+                        // handle service worker
+                        this.plugins.dispatch('onWorkerCreated', worker);
+                    });
+                }
+            });
+        };
+        // Note: `browser.newPage` will implicitly call `browser.newContext` as well
+        browser.newContext = ((originalMethod, ctx) => {
+            return async (options = {}) => {
+                const contextOptions = (await this.plugins.dispatchBlocking('beforeContext', options || {}, browser)) || options;
+                const context = await originalMethod.call(ctx, contextOptions);
+                this.plugins.dispatch('onContextCreated', context, contextOptions);
+                bindContextEvents(context);
+                return context;
+            };
+        })(browser.newContext, browser);
     }
     /**
-     * Plugin defaults (optional).
+     * Puppeteer: Patch page creation methods (both regular and incognito contexts).
      *
-     * If defined will be ([deep-](https://github.com/TehShrike/deepmerge))merged with the (optional) user supplied options (supplied during plugin instantiation).
+     * Unfortunately it's possible that the `targetcreated` events are not triggered
+     * early enough for listeners (e.g. plugins using `onPageCreated`) to be able to
+     * modify the page instance (e.g. user-agent) before the browser request occurs.
      *
-     * The result of merging defaults with user supplied options can be accessed through `this.opts`.
+     * This only affects the first request of a newly created page target.
      *
-     * @see [[opts]]
+     * As a workaround I've noticed that navigating to `about:blank` (again),
+     * right after a page has been created reliably fixes this issue and adds
+     * no noticable delay or side-effects.
      *
-     * @example
-     * get defaults () {
-     *   return {
-     *     stripHeadless: true,
-     *     makeWindows: true,
-     *     customFn: null
-     *   }
-     * }
+     * This problem is not specific to `puppeteer-extra` but default Puppeteer behaviour.
      *
-     * // Users can overwrite plugin defaults during instantiation:
-     * puppeteer.use(require('puppeteer-extra-plugin-foobar')({ makeWindows: false }))
+     * Note: This patch only fixes explicitly created pages, implicitly created ones
+     * (e.g. through `window.open`) are still subject to this issue. I didn't find a
+     * reliable mitigation for implicitly created pages yet.
+     *
+     * Puppeteer issues:
+     * https://github.com/GoogleChrome/puppeteer/issues/2669
+     * https://github.com/puppeteer/puppeteer/issues/3667
+     * https://github.com/GoogleChrome/puppeteer/issues/386#issuecomment-343059315
+     * https://github.com/GoogleChrome/puppeteer/issues/1378#issue-273733905
+     *
+     * @private
      */
-    get defaults() {
+    _patchPageCreationMethods(browser) {
+        if (!browser || !browser._createPageInContext) {
+            return;
+        }
+        browser._createPageInContext = (function (originalMethod, context) {
+            return async function () {
+                const page = await originalMethod.apply(context, arguments);
+                await page.goto('about:blank');
+                return page;
+            };
+        })(browser._createPageInContext, browser);
+    }
+    _requireLauncherOrThrow() {
+        const driverName = this.env.driverName;
+        const packages = [driverName + '-core', driverName];
+        const launcher = requirePackages(packages);
+        if (launcher) {
+            return launcher;
+        }
+        const driverNamePretty = driverName.charAt(0).toUpperCase() + driverName.slice(1);
+        throw new Error(`
+
+  ${driverNamePretty} is missing. :-)
+
+  I tried requiring ${packages.join(', ')} - no luck.
+
+  Make sure you install one of those packages or use the named 'addExtra' export,
+  to patch a specific (and maybe non-standard) implementation of ${driverNamePretty}.
+
+  To get the latest stable version of ${driverNamePretty} run:
+  'yarn add ${driverName}' or 'npm i ${driverName}'
+  `);
+    }
+}
+function requirePackages(packages) {
+    for (const name of packages) {
+        try {
+            return require(name);
+        }
+        catch (_) {
+            continue; // noop
+        }
+    }
+    return false;
+}
+/** Type guard: check if current options are connect options */
+function isConnectOptions(options) {
+    const yup = 'browserURL' in options ||
+        'browserWSEndpoint' in options ||
+        'wsEndpoint' in options;
+    return yup;
+}
+function getPuppeteerProduct(options) {
+    var _a;
+    // Puppeteer supports defining the browser during launch or through an environment variable
+    const override = (_a = process.env.PUPPETEER_PRODUCT) !== null && _a !== void 0 ? _a : (options || {}).product;
+    return override === 'firefox' ? 'firefox' : 'chromium';
+}
+
+class PlaywrightExtra extends AutomationExtraBase {
+    constructor(_launcherOrBrowserName) {
+        if (typeof _launcherOrBrowserName === 'string') {
+            super('playwright');
+            this.env.browserName = _launcherOrBrowserName;
+        }
+        else {
+            super('playwright', _launcherOrBrowserName);
+            this.env.browserName = _launcherOrBrowserName.name();
+        }
+        this.vanillaLauncher = this.launcher;
+    }
+    // Stuff we augment for plugin purposes
+    async connect(options) {
+        const result = await this._connect(options);
+        return result;
+    }
+    async launch(options) {
+        const result = await this._launch(options);
+        return result;
+    }
+    async connectOverCDP(params) {
         return {};
     }
-    /**
-     * Plugin requirements (optional).
-     *
-     * Signal certain plugin requirements to the base class and the user.
-     *
-     * Currently supported:
-     * - `launch`
-     *   - If the plugin only supports locally created browser instances (no `puppeteer.connect()`),
-     *     will output a warning to the user.
-     * - `headful`
-     *   - If the plugin doesn't work in `headless: true` mode,
-     *     will output a warning to the user.
-     * - `runLast`
-     *   - In case the plugin prefers to run after the others.
-     *     Useful when the plugin needs data from others.
-     *
-     * @note
-     * The plugin code will still be executed, only a warning will be shown to the user.
-     *
-     * @example
-     * get requirements () {
-     *   return new Set(['runLast', 'dataFromPlugins'])
-     * }
-     */
-    get requirements() {
-        return new Set([]);
+    // FIXME: Augment this
+    async launchPersistentContext(userDataDir, options // Not exported
+    ) {
+        console.warn('Note: launchPersistentContext does not trigger plugins currently.');
+        return await this.vanillaLauncher.launchPersistentContext(userDataDir, options);
     }
-    /**
-     * Plugin filter statements (optional).
-     *
-     * Filter this plugin from being called depending on the environment.
-     *
-     * @note
-     * `include` or `exclude` are mutually exclusive, use one or the other.
-     *
-     * @example
-     * get filter() {
-     *   return {
-     *     include: ['playwright:chromium', 'puppeteer:chromium']
-     *   }
-     * }
-     */
-    get filter() {
-        return;
+    async launchServer(options // Not exported
+    ) {
+        return await this.vanillaLauncher.launchServer(options);
     }
-    /**
-     * Plugin dependencies (optional).
-     *
-     * Missing plugins will be required() by automation-extra.
-     *
-     * @note
-     * Look into using `plugins` instead if you want to avoid dynamic imports.
-     *
-     * @example
-     * // Will ensure the 'puppeteer-extra-plugin-user-preferences' plugin is loaded.
-     * get dependencies () {
-     *   return new Set(['user-preferences'])
-     * }
-     *
-     * // Will load `user-preferences` plugin and pass `{ beCool: true }` as opts
-     * get dependencies () {
-     *   return new Map([['user-preferences', { beCool: true }]])
-     * }
-     *
-     */
-    get dependencies() {
-        return new Set([]);
+    // Playwright specific things we just pipe through
+    executablePath() {
+        return this.vanillaLauncher.executablePath();
     }
-    /**
-     * Add additional plugins (optional).
-     *
-     * Expects an array of AutomationExtraPlugin instances, not classes.
-     * This is intended to be used by "meta" plugins that use other plugins behind the scenes.
-     *
-     * The benefit over using `dependencies` is that this doesn't use the framework for dynamic imports,
-     * but requires explicit imports which bundlers like webkit handle much better.
-     *
-     * Missing plugins listed here will be added at the start of `launch` or `connect` events.
-     */
-    get plugins() {
-        return [];
-    }
-    /**
-     * Access the plugin options (usually the `defaults` merged with user defined options)
-     *
-     * To skip the auto-merging of defaults with user supplied opts don't define a `defaults`
-     * property and set the `this._opts` Object in your plugin constructor directly.
-     *
-     * @see [[defaults]]
-     *
-     * @example
-     * get defaults () { return { foo: "bar" } }
-     *
-     * async onPageCreated (page) {
-     *   this.debug(this.opts.foo) // => bar
-     * }
-     */
-    get opts() {
-        return this._opts;
-    }
-    /**
-     *  Convenience debug logger based on the [debug] module.
-     *  Will automatically namespace the logging output to the plugin package name.
-     *  [debug]: https://www.npmjs.com/package/debug
-     *
-     *  ```bash
-     *  # toggle output using environment variables
-     *  DEBUG=automation-extra-plugin:<plugin_id> node foo.js
-     *  # to debug all the things:
-     *  DEBUG=automation-extra,automation-extra-plugin:* node foo.js
-     *  ```
-     *
-     * @example
-     * this.debug('hello world')
-     * // will output e.g. 'automation-extra-plugin:anonymize-ua hello world'
-     */
-    get debug() {
-        return debug(`automation-extra-plugin:${this.id}`);
-    }
-    /**
-     * Contains info regarding the launcher environment the plugin runs in
-     * @see LauncherEnv
-     */
-    get env() {
-        if (!this._env) {
-            throw new Error('Launcher env not available yet, you need to register the plugin before using it.');
-        }
-        return this._env;
-    }
-    /** @private */
-    set env(env) {
-        this._env = env;
-    }
-    /**
-     * @private
-     */
-    get _isAutomationExtraPlugin() {
-        return true;
-    }
-}
-/**
- * Plugin id/name (required)
- *
- * Convention:
- * - Package: `automation-extra-plugin-anonymize-ua`
- * - Name: `anonymize-ua`
- *
- * @example
- * static id = 'anonymize-ua';
- * // or
- * static get id() {
- *   return 'anonymize-ua'
- * }
- */
-AutomationExtraPlugin.id = 'base-plugin';
-/**
- * TypeGuards: They allow differentiating between different objects and types.
- *
- * Type guards work by discriminating against properties only found in that specific type.
- * This is especially useful when used with TypeScript as it improves type safety.
- *
- * @class TypeGuards
- * @abstract
- */
-class TypeGuards {
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPage(obj) {
-        return 'goto' in obj && 'url' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isBrowser(obj) {
-        return 'newPage' in obj && 'close' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPuppeteerPage(obj) {
-        return 'setUserAgent' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPuppeteerBrowser(obj) {
-        return 'createIncognitoBrowserContext' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPuppeteerBrowserContext(obj) {
-        return 'clearPermissionOverrides' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPlaywrightPage(obj) {
-        return 'unroute' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPlaywrightBrowser(obj) {
-        return 'newContext' in obj;
-    }
-    /**
-     * Type guard, will make TypeScript understand which type we're working with.
-     * @param obj - The object to test
-     * @returns {boolean}
-     */
-    isPlaywrightBrowserContext(obj) {
-        return 'addCookies' in obj;
-    }
-}
-/**
- * Stores environment specific info, populated by the launcher.
- * This allows sane plugin development in a multi-browser, multi-driver environment.
- *
- * @class LauncherEnv
- * @extends {TypeGuards}
- */
-class LauncherEnv extends TypeGuards {
-    /** @private */
-    constructor(driverName) {
-        super();
-        /**
-         * The name of the driver currently in use: `"playwright" | "puppeteer"`.
-         */
-        this.driverName = 'unknown';
-        /**
-         * The name of the browser engine currently in use: `"chromium" | "firefox" | "webkit" | "unknown"`.
-         *
-         * Note: With puppeteer the browser will only be known once a browser object is available (after launching or connecting),
-         * as they support defining the browser during `.launch()`.
-         */
-        this.browserName = 'unknown';
-        if (driverName) {
-            this.driverName = driverName;
-        }
-        this.events = new EventEmitter();
-    }
-    // Helper methods for convenience
-    /** Check if current driver is puppeteer */
-    get isPuppeteer() {
-        return this.driverName === 'puppeteer';
-    }
-    /** Check if current driver is playwright */
-    get isPlaywright() {
-        return this.driverName === 'playwright';
-    }
-    /** Check if current browser is chrome or chromium */
-    get isChromium() {
-        return this.browserName === 'chromium';
-    }
-    /** Check if current browser is firefox */
-    get isFirefox() {
-        return this.browserName === 'firefox';
-    }
-    /** Check if current browser is webkit */
-    get isWebkit() {
-        return this.browserName === 'webkit';
-    }
-    /** Check if current browser is known */
-    get isBrowserKnown() {
-        return this.browserName !== 'unknown';
-    }
-}
-/**
- * Cache per-page cdp sessions
- * @private
- */
-const cdpSessionCache = new WeakMap();
-/**
- * Unified Page methods for Playwright & Puppeteer.
- * They support common actions through a single API.
- *
- * @class PageShim
- */
-class PageShim {
-    constructor(env, page) {
-        this.env = env;
-        this.page = page;
-        this.unsupportedShimError = new Error(`Unsupported shim: ${this.env.driverName}/${this.env.browserName}`);
-    }
-    /**
-     * Adds a script which would be evaluated in one of the following scenarios:
-     *
-     * Whenever the page is navigated.
-     * Whenever the child frame is attached or navigated. In this case, the script is evaluated in the context of the newly attached frame.
-     *
-     * The script is evaluated after the document was created but before any of its scripts were run.
-     *
-     * @see
-     * **Playwright:** `addInitScript`
-     * **Puppeteer:** `evaluateOnNewDocument`
-     */
-    async addScript(script, arg) {
-        if (this.env.isPuppeteerPage(this.page)) {
-            return this.page.evaluateOnNewDocument(script, arg);
-        }
-        if (this.env.isPlaywrightPage(this.page)) {
-            return this.page.addInitScript(script, arg);
-        }
-        throw this.unsupportedShimError;
-    }
-    /**
-     * Chromium browsers only: Return a fully typed CDP session.
-     *
-     * @see https://playwright.dev/docs/api/class-cdpsession/
-     * @see https://pptr.dev/#?product=Puppeteer&version=v7.0.4&show=api-class-cdpsession
-     */
-    async getCDPSession() {
-        if (this.env.isBrowserKnown && !this.env.isChromium) {
-            throw new Error('CDP sessions are only available for chromium based browsers.');
-        }
-        const session = cdpSessionCache.get(this.page);
-        if (session) {
-            return session;
-        }
-        const createSession = () => {
-            if (this.env.isPuppeteerPage(this.page)) {
-                // In puppeteer we can re-use the existing connection,
-                // I haven't found a way to do that in playwright yet
-                return this.page._client;
-                // return this.page.target().createCDPSession()
-            }
-            if (this.env.isPlaywrightPage(this.page)) {
-                return this.page.context().newCDPSession(this.page);
-            }
-            throw this.unsupportedShimError;
-        };
-        const newSession = await createSession();
-        cdpSessionCache.set(this.page, newSession);
-        return newSession;
+    name() {
+        return this.vanillaLauncher.name();
     }
 }
 
-export { AutomationExtraPlugin, LauncherEnv, PageShim, PluginLifecycleMethods, TypeGuards };
+class PuppeteerExtra extends AutomationExtraBase {
+    constructor(_launcher) {
+        super('puppeteer', _launcher);
+        this.vanillaLauncher = this
+            .launcher;
+        // Puppeteer supports defining the browser during `.launch`
+        this.env.browserName = 'unknown';
+    }
+    // Stuff we augment for plugin purposes
+    async connect(options) {
+        const result = await this._connect(options);
+        return result;
+    }
+    async launch(options) {
+        const result = await this._launch(options);
+        return result;
+    }
+    // Puppeteer specific things we just pipe through
+    defaultArgs(options) {
+        return this.vanillaLauncher.defaultArgs(options);
+    }
+    executablePath() {
+        return this.vanillaLauncher.executablePath();
+    }
+    createBrowserFetcher(options) {
+        return this.vanillaLauncher.createBrowserFetcher(options);
+    }
+}
+
+/**
+ * Augment a Puppeteer or Playwright API compatible browser launcher with plugin functionality.
+ * Note: We can't use `addExtra` here as we wildcard export this file in `playwright-extra` and `puppeteer-extra`
+ *
+ * @param launcher - Puppeteer or Playwright API compatible browser launcher
+ * @private
+ */
+const _addExtra = (launcher) => {
+    // General checks
+    if (!launcher || typeof launcher !== 'object') {
+        throw new Error('Invalid browser launcher: Expected object.');
+    }
+    if (!('launch' in launcher || 'connect' in launcher)) {
+        throw new Error('Invalid browser launcher: Must provide "launch" or "connect" method.');
+    }
+    // Check for Playwright
+    if ('name' in launcher) {
+        const validBrowserNames = [
+            'chromium',
+            'firefox',
+            'webkit'
+        ];
+        const hasValidBrowserName = validBrowserNames.includes(launcher.name());
+        if (!hasValidBrowserName) {
+            throw new Error(`Invalid Playwright launcher: Unexpected browser name "${launcher.name()}".`);
+        }
+        return new PlaywrightExtra(launcher);
+    }
+    // Everything else we treat as Puppeteer or a custom puppeteer-like implementation
+    return new PuppeteerExtra(launcher);
+};
+/**
+ * Augment the provided Playwright browser launcher with plugin functionality.
+ *
+ * @example
+ * import playwright from 'playwright'
+ * const chromium = addExtra(playwright.chromium)
+ * chromium.use(plugin)
+ *
+ * @param launcher - Playwright (or compatible) browser launcher
+ */
+const addExtraPlaywright = (launcher) => _addExtra(launcher);
+/**
+ * Augment the provided Puppeteer browser launcher with plugin functionality.
+ *
+ * @example
+ * import vanillaPuppeteer from 'puppeteer'
+ * const puppeteer = addExtra(vanillaPuppeteer)
+ * puppeteer.use(plugin)
+ *
+ * @param launcher - Puppeteer (or compatible) browser launcher
+ */
+const addExtraPuppeteer = (launcher) => _addExtra(launcher);
+
+export { AutomationExtraBase, PlaywrightExtra, PuppeteerExtra, _addExtra, addExtraPlaywright, addExtraPuppeteer };
 //# sourceMappingURL=index.esm.js.map

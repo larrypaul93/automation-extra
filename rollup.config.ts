@@ -1,8 +1,11 @@
+/* eslint-disable @typescript-eslint/strict-boolean-expressions */
+/* eslint-disable @typescript-eslint/restrict-template-expressions */
 import commonjs from 'rollup-plugin-commonjs'
 import resolve from 'rollup-plugin-node-resolve'
 import sourceMaps from 'rollup-plugin-sourcemaps'
 import typescript from 'rollup-plugin-typescript2'
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
 const pkg = require('./package.json')
 
 const entryFile = 'index'
@@ -14,6 +17,11 @@ const banner = `
  */
 `.trim()
 
+const defaultExportOutro = `
+  module.exports = exports.default || {}
+  Object.entries(exports).forEach(([key, value]) => { module.exports[key] = value })
+`
+
 export default {
   input: `src/${entryFile}.ts`,
   output: [
@@ -21,23 +29,25 @@ export default {
       file: pkg.main,
       format: 'cjs',
       sourcemap: true,
-      banner,
+      exports: 'named',
+      outro: defaultExportOutro,
+      banner
     },
     {
       file: pkg.module,
       format: 'es',
       sourcemap: true,
-      banner,
-    },
+      exports: 'named',
+      banner
+    }
   ],
   // Indicate here external modules you don't wanna include in your bundle (i.e.: 'lodash')
   external: [
-    'events',
     ...Object.keys(pkg.dependencies || {}),
-    ...Object.keys(pkg.peerDependencies || {}),
+    ...Object.keys(pkg.peerDependencies || {})
   ],
   watch: {
-    include: 'src/**',
+    include: 'src/**'
   },
   plugins: [
     // Compile TypeScript files
@@ -47,8 +57,8 @@ export default {
     // Allow node_modules resolution, so you can use 'external' to control
     // which external modules to include in the bundle
     // https://github.com/rollup/rollup-plugin-node-resolve#usage
-    resolve({ preferBuiltins: true }),
+    resolve(),
     // Resolve source maps to the original source
-    sourceMaps(),
-  ],
+    sourceMaps()
+  ]
 }
