@@ -67,7 +67,7 @@
     "automation-extra-plugin": "larrypaul93/automation-extra-plugin",
     "debug": "^4.1.1",
     "deepmerge": "^4.2.2",
-    "playwright-core": "1.11.1",
+    "playwright-core": "*",
     "puppeteer-extra-plugin": "*"
   }
 }
